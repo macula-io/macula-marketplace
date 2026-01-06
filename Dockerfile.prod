@@ -1,0 +1,128 @@
+# Dockerfile.prod - Macula Marketplace Production
+# Edge-deployable marketplace client with SQLite
+# Multi-stage build for minimal runtime image
+#
+# Build: docker build -f Dockerfile.prod -t maculacid/macula-marketplace:latest .
+# Run: docker run -p 4000:4000 -v ./data:/app/data maculacid/macula-marketplace:latest
+
+ARG ELIXIR_VERSION=1.17.3
+ARG OTP_VERSION=27.1.2
+ARG DEBIAN_VERSION=bookworm-20241016-slim
+ARG BUILDER_IMAGE="hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_VERSION}"
+ARG RUNNER_IMAGE="debian:${DEBIAN_VERSION}"
+
+# =============================================================================
+# BUILD STAGE
+# =============================================================================
+FROM ${BUILDER_IMAGE} AS builder
+
+# Install build dependencies
+RUN apt-get update -y && apt-get install -y \
+    build-essential \
+    git \
+    curl \
+    cmake \
+    libssl-dev \
+    && apt-get clean && rm -f /var/lib/apt/lists/*_*
+
+# Install Rust toolchain (required for macula_nifs)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+# Install hex + rebar
+RUN mix local.hex --force && \
+    mix local.rebar --force
+
+# Set production environment
+ENV MIX_ENV=prod
+
+# Copy mix files for dependency caching
+COPY system/mix.exs system/mix.lock ./
+
+# Create apps directory structure
+RUN mkdir -p apps/macula_marketplace apps/macula_marketplace_web
+
+COPY system/apps/macula_marketplace/mix.exs ./apps/macula_marketplace/
+COPY system/apps/macula_marketplace_web/mix.exs ./apps/macula_marketplace_web/
+
+# Copy config (needed for deps.get)
+COPY system/config ./config
+
+# Get and compile dependencies from hex.pm
+RUN mix deps.get --only $MIX_ENV
+RUN mix deps.compile
+
+# Copy release overlays (migration scripts)
+COPY system/rel ./rel
+
+# Copy application source
+COPY system/apps/macula_marketplace/lib ./apps/macula_marketplace/lib
+COPY system/apps/macula_marketplace/priv ./apps/macula_marketplace/priv
+COPY system/apps/macula_marketplace_web/lib ./apps/macula_marketplace_web/lib
+COPY system/apps/macula_marketplace_web/priv ./apps/macula_marketplace_web/priv
+COPY system/apps/macula_marketplace_web/assets ./apps/macula_marketplace_web/assets
+
+WORKDIR /app
+
+# Compile application
+RUN mix compile
+
+# Build assets with esbuild and tailwind
+RUN mix assets.deploy
+
+# Build release
+RUN mix release macula_marketplace
+
+# =============================================================================
+# RUNTIME STAGE
+# =============================================================================
+FROM ${RUNNER_IMAGE}
+
+# Install runtime dependencies
+RUN apt-get update -y && \
+    apt-get install -y \
+    libstdc++6 \
+    openssl \
+    libncurses5 \
+    locales \
+    sqlite3 \
+    ca-certificates \
+    && apt-get clean && rm -f /var/lib/apt/lists/*_*
+
+# Set locale
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+WORKDIR /app
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash app
+RUN mkdir -p /app/data && chown -R app:app /app
+
+# Copy release from builder
+COPY --from=builder --chown=app:app /app/_build/prod/rel/macula_marketplace ./
+
+# Create data directory for SQLite
+RUN mkdir -p /app/data && chown -R app:app /app/data
+
+USER app
+
+# Set runtime environment
+ENV MIX_ENV=prod
+ENV PORT=4000
+ENV PHX_HOST=localhost
+ENV DATABASE_PATH=/app/data/macula_marketplace.db
+
+# Mesh configuration (can be overridden)
+ENV MACULA_BOOTSTRAP_PEERS=https://boot.macula.io:443
+ENV MACULA_REALM=io.macula
+ENV MACULA_OFFLINE=false
+
+EXPOSE 4000
+
+# Run migrations and start server using release overlay scripts
+CMD ["./bin/start"]

@@ -8,7 +8,23 @@ defmodule MaculaMarketplace.Umbrella.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
+      releases: releases(),
       listeners: [Phoenix.CodeReloader]
+    ]
+  end
+
+  defp releases do
+    [
+      macula_marketplace: [
+        include_executables_for: [:unix],
+        steps: [:assemble, :tar],
+        applications: [
+          macula_marketplace: :permanent,
+          macula_marketplace_web: :permanent
+        ],
+        rel_templates_path: "rel",
+        overlays: "rel/overlays"
+      ]
     ]
   end
 
